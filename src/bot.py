@@ -16,7 +16,7 @@ from config import (
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.DEBUG
 )
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,8 @@ class ISSUrineTracker:
         self.load_subscribers()
         self.lightstreamer_client = None
         self.current_value = None
+        self.subscription = None
+        self.connected = False
 
     def load_subscribers(self) -> None:
         try:
@@ -39,53 +41,156 @@ class ISSUrineTracker:
         with open(SUBSCRIBERS_FILE, 'w') as f:
             f.write('\n'.join(map(str, self.subscribers)))
 
-    def on_item_update(self, item_name, value, timestamp):
-        if item_name == "NODE3000005":
-            try:
-                self.current_value = float(value["Value"])
-                logger.info(f"Received urine tank update: {self.current_value}")
-            except ValueError as e:
-                logger.error(f"Could not convert urine tank value '{value}' to float: {e}")
+    def onStatusChange(self, status):
+        """Called when the connection status changes"""
+        logger.info(f"Lightstreamer connection status changed to: {status}")
+        if status.startswith("CONNECTED:"):  # Accept any CONNECTED status
+            self.connected = True
+        elif status == "DISCONNECTED":
+            self.connected = False
+
+    def onServerError(self, code, message):
+        """Called when the server returns an error"""
+        logger.error(f"Lightstreamer server error: {code} - {message}")
+
+    def onPropertyChange(self, property_name):
+        """Called when a property of the LightstreamerClient changes"""
+        logger.debug(f"Lightstreamer property changed: {property_name}")
+
+    def onItemUpdate(self, update):
+        """Called when we receive an update"""
+        try:
+            logger.debug(f"Raw update received: {update}")
+            
+            if isinstance(update, dict):
+                # Handle initial snapshot
+                logger.info(f"Received snapshot: {update}")
+                if "Value" in update:
+                    try:
+                        self.current_value = float(update["Value"])
+                        logger.info(f"Initial value set to: {self.current_value}")
+                        self.last_urine_level = self.current_value
+                    except ValueError as e:
+                        logger.error(f"Could not convert initial value '{update['Value']}' to float: {e}")
+            else:
+                # Handle updates
+                item_name = update.getItemName()
+                if item_name == "NODE3000005":
+                    value = update.getValue("Value")
+                    timestamp = update.getValue("TimeStamp")
+                    status = update.getValue("Status.Class")
+                    
+                    if value is not None:  # Accept any status for now, just log it
+                        try:
+                            self.current_value = float(value)
+                            logger.info(f"Received urine tank update: {self.current_value} at {timestamp} (Status: {status})")
+                        except ValueError as e:
+                            logger.error(f"Could not convert value '{value}' to float: {e}")
+                    
+                    if status != "24":  # Just log non-default status
+                        logger.warning(f"Received update with non-default status: {status}")
+                
+        except Exception as e:
+            logger.error(f"Error processing update: {e}", exc_info=True)
+
+    def onEndOfSnapshot(self, item_name, item_pos):
+        """Called when a snapshot is complete"""
+        logger.info(f"End of snapshot for {item_name}")
+
+    def onClearSnapshot(self, item_name, item_pos):
+        """Called when the snapshot is cleared"""
+        logger.info(f"Snapshot cleared for {item_name}")
+
+    def onSubscription(self):
+        """Called when the subscription is successfully established"""
+        logger.info("Subscription successfully established")
+
+    def onUnsubscription(self):
+        """Called when the subscription is successfully closed"""
+        logger.info("Subscription successfully closed")
+
+    def onSubscriptionError(self, code, message):
+        """Called when the server rejects a subscription"""
+        logger.error(f"Subscription error: {code} - {message}")
 
     async def connect_lightstreamer(self):
-        # Connect to Lightstreamer
-        self.lightstreamer_client = LightstreamerClient("https://push.lightstreamer.com", "ISSLIVE")
-        self.lightstreamer_client.connect()
+        try:
+            # Connect to Lightstreamer
+            self.lightstreamer_client = LightstreamerClient("https://push.lightstreamer.com", "ISSLIVE")
+            
+            # Add connection status listener
+            self.lightstreamer_client.addListener(self)
+            
+            # Configure subscription for NODE3000005 (Urine Tank)
+            self.subscription = Subscription(
+                mode="MERGE",
+                items=["NODE3000005"],
+                fields=["Value", "TimeStamp", "Status.Class"]
+            )
+            self.subscription.setRequestedSnapshot("yes")
+            self.subscription.addListener(self)
+            
+            logger.info("Connecting to Lightstreamer...")
+            
+            # Connect and subscribe
+            self.lightstreamer_client.connect()
+            
+            # Wait for initial connection
+            for _ in range(30):  # Wait up to 30 seconds
+                if self.connected:
+                    self.lightstreamer_client.subscribe(self.subscription)
+                    logger.info("Successfully connected to Lightstreamer")
+                    return
+                await asyncio.sleep(1)
+            
+            if not self.connected:
+                raise Exception("Failed to connect to Lightstreamer after 30 seconds")
 
-        # Subscribe to NODE3000005 (Urine Tank)
-        subscription = Subscription(
-            mode="MERGE",
-            items=["NODE3000005"],
-            fields=["Value", "TimeStamp"]
-        )
-        subscription.addListener(self.on_item_update)
-        self.lightstreamer_client.subscribe(subscription)
+        except Exception as e:
+            logger.error(f"Error connecting to Lightstreamer: {e}", exc_info=True)
+            raise
 
     async def check_urine_level(self) -> float:
+        if self.current_value is None:
+            logger.warning("No urine tank value available yet")
         return self.current_value
 
     async def monitor_urine_level(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        current_level = await self.check_urine_level()
-        
-        if current_level is None:
+        if self.current_value is None:
+            logger.warning("Skipping monitor - no value available yet")
             return
 
-        if abs(current_level - self.last_urine_level) >= MIN_CHANGE_THRESHOLD:
-            change = current_level - self.last_urine_level
+        if abs(self.current_value - self.last_urine_level) >= MIN_CHANGE_THRESHOLD:
+            change = self.current_value - self.last_urine_level
             message = (
                 f"🚽 ISS Urine Tank Update!\n"
                 f"Previous level: {self.last_urine_level:.1f}%\n"
-                f"Current level: {current_level:.1f}%\n"
+                f"Current level: {self.current_value:.1f}%\n"
                 f"Change: {change:+.1f}%"
             )
             
+            logger.info(f"Sending update to {len(self.subscribers)} subscribers")
             for chat_id in self.subscribers:
                 try:
                     await context.bot.send_message(chat_id=chat_id, text=message)
                 except Exception as e:
                     logger.error(f"Failed to send message to {chat_id}: {e}")
             
-            self.last_urine_level = current_level
+            self.last_urine_level = self.current_value
+
+    async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        current_level = await self.check_urine_level()
+        connection_status = "Connected" if self.connected else "Disconnected"
+        if current_level is not None:
+            await update.message.reply_text(
+                f"Connection Status: {connection_status}\n"
+                f"Current ISS Urine Tank Level: {current_level:.1f}%"
+            )
+        else:
+            await update.message.reply_text(
+                f"Connection Status: {connection_status}\n"
+                "Unable to fetch current urine tank level."
+            )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -117,6 +222,20 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text("Unable to fetch current urine tank level.")
 
+async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Test command to verify connection and last received values"""
+    connection_status = "Connected" if tracker.connected else "Disconnected"
+    current_value = tracker.current_value
+    last_update = tracker.last_urine_level
+    
+    message = (
+        f"🔍 Connection Test:\n"
+        f"Connection Status: {connection_status}\n"
+        f"Current Value: {current_value:.1f% if current_value else 'None'}\n"
+        f"Last Update Value: {last_update:.1f% if last_update else 'None'}\n"
+    )
+    await update.message.reply_text(message)
+
 def main() -> None:
     # Initialize the application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -125,6 +244,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("test", test))
 
     # Initialize job queue
     job_queue = application.job_queue

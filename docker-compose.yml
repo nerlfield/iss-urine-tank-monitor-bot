@@ -7,4 +7,4 @@ services:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
     volumes:
       - ./data:/app/data
-    restart: unless-stopped 
+    restart: always
