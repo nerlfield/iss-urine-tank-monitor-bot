@@ -231,8 +231,8 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
         f"🔍 Connection Test:\n"
         f"Connection Status: {connection_status}\n"
-        f"Current Value: {current_value:.1f% if current_value else 'None'}\n"
-        f"Last Update Value: {last_update:.1f% if last_update else 'None'}\n"
+        f"Current Value: {f'{current_value:.1f}%' if current_value is not None else 'None'}\n"
+        f"Last Update Value: {f'{last_update:.1f}%' if last_update is not None else 'None'}\n"
     )
     await update.message.reply_text(message)
 
