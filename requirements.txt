@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]==20.7
+aiohttp==3.9.1
+beautifulsoup4==4.12.2
+lightstreamer-client-lib>=1.0.0 
