@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class ISSUrineTracker:
     def __init__(self):
         self.subscribers: Set[int] = set()
-        self.last_urine_level: float = 0.0
+        self.last_urine_level: float = 47.0
         self.load_subscribers()
         self.lightstreamer_client = None
         self.current_value = None
@@ -170,7 +170,9 @@ class ISSUrineTracker:
             )
             
             logger.info(f"Sending update to {len(self.subscribers)} subscribers")
-            for chat_id in self.subscribers:
+            
+            subscribers_copy = self.subscribers.copy()
+            for chat_id in subscribers_copy:
                 try:
                     await context.bot.send_message(chat_id=chat_id, text=message)
                 except Exception as e:
